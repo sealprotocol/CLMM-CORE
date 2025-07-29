@@ -1,6 +1,6 @@
 # SealProtocol CLMM on Sui
 
-This repository contains the on-chain implementation of an Automated Market Maker (CLMM) for the [SealProtocol](https://github.com/sealprotocol). It is written in [Sui Move](https://docs.sui.io/), a smart contract language designed for the Sui blockchain.
+This repository contains the on-chain implementation of a Centralized Liquidity Automated Market Maker (CLMM) for the [SealProtocol](https://github.com/sealprotocol). It is written in [Sui Move](https://docs.sui.io/), a smart contract language designed for the Sui blockchain.
 
 ## 🔍 Overview
 
