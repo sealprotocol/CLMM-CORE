@@ -1,10 +1,16 @@
+#[allow(unused_variable, unused_use, duplicate_alias, deprecated_usage, unused_const, unused_function)]
 module clmm::clmm {
     use sui::coin::{Self, Coin};
     use sui::balance::{Self, Balance};
+    use sui::object::{Self, UID};
+    use sui::transfer;
+    use sui::tx_context::{Self, TxContext};
     use sui::table::{Self, Table};
     use sui::clock::{Self, Clock};
     use std::type_name::{Self, TypeName};
-    use sui::event;
+    use std::vector;
+    use std::ascii;
+    use clmm::xseal::{Self, StakingPool};
 
     // Error codes
     const EInsufficientLiquidity: u64 = 0;
@@ -13,56 +19,29 @@ module clmm::clmm {
     const EInsufficientBalance: u64 = 3;
     const EInvalidFee: u64 = 4;
     const EInvalidTokenPair: u64 = 5;
+    const EInvalidRatio: u64 = 6;
+    const ENoLiquidity: u64 = 7;
     const EInvalidTimestamp: u64 = 8;
-    const EInvalidTickRange: u64 = 10;
-    const EInvalidTick: u64 = 11;
-    const EPositionNotFound: u64 = 12;
-    const EPriceOutOfRange: u64 = 13;
-
-    // Constants
-    const MAX_TICK: u32 = 2_147_483_647;
-    const MIN_TICK: u32 = 0;
-    const SQRT_PRICE_PRECISION: u128 = 1_000_000_000_000_000_000; // Q64.64
-    const FEE_DENOMINATOR: u64 = 1_000_000;
+    const ENotAdmin: u64 = 9;
+    const EInvalidTokenOrder: u64 = 10;
+    const EInvalidPath: u64 = 11;
+    const EPoolNotFound: u64 = 12;
+    const ENoValidPools: u64 = 13;
+    const EInsufficientOutput: u64 = 14;
 
     // Admin capability
-    public struct AdminCap has key, store {
-        id: sui::object::UID,
+    public struct AdminCap has key {
+        id: UID,
     }
 
-    // Position NFT
-    public struct Position has key, store {
-        id: sui::object::UID,
-        pool_id: address,
-        tick_lower: u32,
-        tick_upper: u32,
-        liquidity: u128,
-        fee_owed_x: u64,
-        fee_owed_y: u64,
-    }
-
-    // Tick data
-    public struct Tick has store {
-        liquidity_gross: u128,
-        liquidity_net: u128,
-        fee_growth_outside_x: u128,
-        fee_growth_outside_y: u128,
-    }
-
-    // Liquidity Pool
+    // Liquidity Pool struct
     public struct LiquidityPool<phantom X, phantom Y> has key, store {
-        id: sui::object::UID,
+        id: UID,
         reserve_x: Balance<X>,
         reserve_y: Balance<Y>,
-        fee_rate: u64,
-        tick_spacing: u32,
-        current_tick: u32,
-        current_sqrt_price: u128,
-        liquidity: u128,
-        ticks: Table<u32, Tick>,
-        positions: Table<address, vector<Position>>,
-        fee_growth_global_x: u128,
-        fee_growth_global_y: u128,
+        fee_rate: u64, // Basis points (e.g., 25 = 0.25%)
+        total_liquidity: u128,
+        user_shares: Table<address, u128>,
         fee_balance_x: Balance<X>,
         fee_balance_y: Balance<Y>,
         platform_fee_x: Balance<X>,
@@ -74,9 +53,19 @@ module clmm::clmm {
 
     // Pool Registry
     public struct PoolRegistry has key, store {
-        id: sui::object::UID,
-        pools: vector<PoolInfo>,
+        id: UID,
+        pools: Table<TypePair, vector<PoolInfo>>,
+        type_pairs: vector<TypePair>,
         total_tvl: u64,
+        is_distribution_enabled: bool, // Switch for fee distribution
+        staking_pool: address, // Address of the StakingPool
+        developer_wallet: address, // Developer wallet address
+    }
+
+    // Type pair for indexing pools
+    public struct TypePair has copy, drop, store {
+        token_x: TypeName,
+        token_y: TypeName,
     }
 
     // Pool metadata
@@ -85,665 +74,428 @@ module clmm::clmm {
         token_y: TypeName,
         pool_addr: address,
         fee_rate: u64,
-        tick_spacing: u32,
     }
 
-    // Events
-    public struct PoolCreated has copy, drop {
-        pool_id: address,
-        token_x: TypeName,
-        token_y: TypeName,
-        fee_rate: u64,
-        tick_spacing: u32,
+    // Constants
+    const DEVELOPER_WALLET: address = @0x1234567890abcdef; // Placeholder developer wallet address
+
+    // Getters for PoolRegistry and PoolInfo
+    public fun get_pools(registry: &PoolRegistry): &Table<TypePair, vector<PoolInfo>> {
+        &registry.pools
     }
 
-    public struct LiquidityAdded has copy, drop {
-        pool_id: address,
-        position_id: address,
-        tick_lower: u32,
-        tick_upper: u32,
-        liquidity: u128,
-        amount_x: u64,
-        amount_y: u64,
+    public fun get_type_pairs(registry: &PoolRegistry): vector<TypePair> {
+        registry.type_pairs
     }
 
-    public struct LiquidityRemoved has copy, drop {
-        pool_id: address,
-        position_id: address,
-        tick_lower: u32,
-        tick_upper: u32,
-        liquidity: u128,
-        amount_x: u64,
-        amount_y: u64,
+    public fun get_registry_id(registry: &PoolRegistry): &UID {
+        &registry.id
     }
 
-    public struct SwapEvent has copy, drop {
-        pool_id: address,
-        amount_in: u64,
-        amount_out: u64,
-        zero_for_one: bool,
-        fee_amount: u64,
+    public fun get_pool_addr(info: &PoolInfo): address {
+        info.pool_addr
+    }
+
+    public fun get_type_pair_token_x(pair: &TypePair): TypeName {
+        pair.token_x
+    }
+
+    public fun get_type_pair_token_y(pair: &TypePair): TypeName {
+        pair.token_y
+    }
+
+    public fun get_pool_info_fee_rate(info: &PoolInfo): u64 {
+        info.fee_rate
+    }
+
+    // Get all token types in registry
+    public fun get_all_token_types(registry: &PoolRegistry): vector<TypeName> {
+        let mut token_types = vector::empty<TypeName>();
+        let type_pairs = &registry.type_pairs;
+        let mut i = 0;
+        while (i < vector::length(type_pairs)) {
+            let pair = vector::borrow(type_pairs, i);
+            let token_x = pair.token_x;
+            let token_y = pair.token_y;
+            if (!vector::contains(&token_types, &token_x)) {
+                vector::push_back(&mut token_types, token_x);
+            };
+            if (!vector::contains(&token_types, &token_y)) {
+                vector::push_back(&mut token_types, token_y);
+            };
+            i = i + 1;
+        };
+        token_types
+    }
+
+    // Compare two byte vectors lexicographically
+    public fun compare_bytes(a: &vector<u8>, b: &vector<u8>): bool {
+        let len_a = vector::length(a);
+        let len_b = vector::length(b);
+        let min_len = if (len_a < len_b) len_a else len_b;
+        let mut i = 0;
+
+        while (i < min_len) {
+            let byte_a = *vector::borrow(a, i);
+            let byte_b = *vector::borrow(b, i);
+            if (byte_a < byte_b) return true;
+            if (byte_a > byte_b) return false;
+            i = i + 1;
+        };
+        len_a < len_b
+    }
+
+    // Create TypePair
+    public fun create_type_pair<X, Y>(): TypePair {
+        let token_x_name = type_name::get<X>();
+        let token_y_name = type_name::get<Y>();
+        TypePair { token_x: token_x_name, token_y: token_y_name }
     }
 
     // Initialize module
-    fun init(ctx: &mut sui::tx_context::TxContext) {
+    fun init(ctx: &mut TxContext) {
         let registry = PoolRegistry {
-            id: sui::object::new(ctx),
-            pools: vector::empty(),
+            id: object::new(ctx),
+            pools: table::new(ctx),
+            type_pairs: vector::empty(),
             total_tvl: 0,
+            is_distribution_enabled: false,
+            staking_pool: @0x0, // Placeholder, to be set later
+            developer_wallet: DEVELOPER_WALLET,
         };
-        sui::transfer::public_share_object(registry);
+        transfer::public_share_object(registry);
 
         let admin_cap = AdminCap {
-            id: sui::object::new(ctx),
+            id: object::new(ctx),
         };
-        sui::transfer::transfer(admin_cap, sui::tx_context::sender(ctx));
+        transfer::transfer(admin_cap, tx_context::sender(ctx));
     }
 
-    // Create a new CLMM pool
+    // Set staking pool address
+    public entry fun set_staking_pool(
+        _cap: &AdminCap,
+        registry: &mut PoolRegistry,
+        staking_pool: address,
+        ctx: &mut TxContext
+    ) {
+        assert!(tx_context::sender(ctx) == registry.developer_wallet, ENotAdmin);
+        registry.staking_pool = staking_pool;
+    }
+
+    // Enable fee distribution (called after TGE)
+    public entry fun enable_distribution(
+        _cap: &AdminCap,
+        registry: &mut PoolRegistry,
+        ctx: &mut TxContext
+    ) {
+        assert!(tx_context::sender(ctx) == registry.developer_wallet, ENotAdmin);
+        assert!(registry.staking_pool != @0x0, EInvalidAmount); // Ensure staking pool is set
+        registry.is_distribution_enabled = true;
+    }
+
+    // Create a new liquidity pool with sorted token pair
     public entry fun create_pool<X, Y>(
         registry: &mut PoolRegistry,
         fee_rate: u64,
-        tick_spacing: u32,
-        initial_sqrt_price: u128,
-        ctx: &mut sui::tx_context::TxContext
+        ctx: &mut TxContext
     ) {
-        assert!(fee_rate == 500 || fee_rate == 3000 || fee_rate == 10000, EInvalidFee);
-        assert!(tick_spacing > 0, EInvalidTick);
+        assert!(
+            fee_rate == 0 || fee_rate == 1 || fee_rate == 5 || fee_rate == 20 || fee_rate == 25 || fee_rate == 100 || fee_rate == 200,
+            EInvalidFee
+        );
         assert!(type_name::get<X>() != type_name::get<Y>(), EInvalidTokenPair);
-        assert!(initial_sqrt_price > 0, EPriceOutOfRange);
 
+        let token_x_name = type_name::get<X>();
+        let token_y_name = type_name::get<Y>();
+        let token_x_str = type_name::into_string(token_x_name);
+        let token_y_str = type_name::into_string(token_y_name);
+        assert!(compare_bytes(&ascii::into_bytes(token_x_str), &ascii::into_bytes(token_y_str)), EInvalidTokenOrder);
+
+        let type_pair = create_type_pair<X, Y>();
+        if (!table::contains(&registry.pools, type_pair)) {
+            table::add(&mut registry.pools, type_pair, vector::empty());
+            vector::push_back(&mut registry.type_pairs, type_pair);
+        };
+        let pools = table::borrow_mut(&mut registry.pools, type_pair);
         let mut i = 0;
-        while (i < vector::length(&registry.pools)) {
-            let pool_info = vector::borrow(&registry.pools, i);
-            assert!(
-                !(pool_info.token_x == type_name::get<X>() && pool_info.token_y == type_name::get<Y>() && pool_info.fee_rate == fee_rate),
-                EPoolAlreadyExists
-            );
+        while (i < vector::length(pools)) {
+            let pool_info = vector::borrow(pools, i);
+            assert!(get_pool_info_fee_rate(pool_info) != fee_rate, EPoolAlreadyExists);
             i = i + 1;
         };
 
         let pool = LiquidityPool<X, Y> {
-            id: sui::object::new(ctx),
-            reserve_x: balance::zero<X>(),
-            reserve_y: balance::zero<Y>(),
+            id: object::new(ctx),
+            reserve_x: balance::zero(),
+            reserve_y: balance::zero(),
             fee_rate,
-            tick_spacing,
-            current_tick: MIN_TICK,
-            current_sqrt_price: initial_sqrt_price,
-            liquidity: 0,
-            ticks: table::new(ctx),
-            positions: table::new(ctx),
-            fee_growth_global_x: 0,
-            fee_growth_global_y: 0,
-            fee_balance_x: balance::zero<X>(),
-            fee_balance_y: balance::zero<Y>(),
-            platform_fee_x: balance::zero<X>(),
-            platform_fee_y: balance::zero<Y>(),
+            total_liquidity: 0,
+            user_shares: table::new(ctx),
+            fee_balance_x: balance::zero(),
+            fee_balance_y: balance::zero(),
+            platform_fee_x: balance::zero(),
+            platform_fee_y: balance::zero(),
             volume_24h: 0,
             fees_24h: 0,
             last_update: 0,
         };
-        let pool_addr = sui::object::id_address(&pool);
+        let pool_addr = object::uid_to_address(&pool.id);
 
         let pool_info = PoolInfo {
-            token_x: type_name::get<X>(),
-            token_y: type_name::get<Y>(),
+            token_x: token_x_name,
+            token_y: token_y_name,
             pool_addr,
             fee_rate,
-            tick_spacing,
         };
-        vector::push_back(&mut registry.pools, pool_info);
+        vector::push_back(pools, pool_info);
 
-        event::emit(PoolCreated {
-            pool_id: pool_addr,
-            token_x: type_name::get<X>(),
-            token_y: type_name::get<Y>(),
-            fee_rate,
-            tick_spacing,
-        });
-
-        sui::transfer::public_share_object(pool);
+        transfer::public_share_object(pool);
     }
 
-    // Add liquidity
-    public entry fun add_liquidity<X, Y>(
+    // Add initial liquidity
+    public entry fun add_liquidity_initial<X, Y>(
         pool: &mut LiquidityPool<X, Y>,
         coin_x: Coin<X>,
         coin_y: Coin<Y>,
-        tick_lower: u32,
-        tick_upper: u32,
-        liquidity: u128,
         registry: &mut PoolRegistry,
-        ctx: &mut sui::tx_context::TxContext
+        ctx: &mut TxContext
     ) {
-        assert!(tick_lower < tick_upper, EInvalidTickRange);
-        assert!(tick_lower >= MIN_TICK && tick_upper <= MAX_TICK, EInvalidTick);
-        assert!(tick_lower % pool.tick_spacing == 0 && tick_upper % pool.tick_spacing == 0, EInvalidTick);
-        assert!(liquidity > 0, EInvalidAmount);
+        let amount_x = coin::value(&coin_x);
+        let amount_y = coin::value(&coin_y);
+        assert!(amount_x > 0 && amount_y > 0, EInvalidAmount);
+        assert!(pool.total_liquidity == 0, EInvalidRatio);
 
-        let (amount_x, amount_y) = calculate_amounts(pool, tick_lower, tick_upper, liquidity);
-        assert!(coin::value(&coin_x) >= amount_x && coin::value(&coin_y) >= amount_y, EInsufficientBalance);
-
-        let sender = sui::tx_context::sender(ctx);
-        let position = Position {
-            id: sui::object::new(ctx),
-            pool_id: sui::object::id_address(pool),
-            tick_lower,
-            tick_upper,
-            liquidity,
-            fee_owed_x: 0,
-            fee_owed_y: 0,
-        };
-
-        update_tick(pool, tick_lower, liquidity, true);
-        update_tick(pool, tick_upper, liquidity, false);
-
-        if (pool.current_tick >= tick_lower && pool.current_tick < tick_upper) {
-            pool.liquidity = pool.liquidity + liquidity;
-        };
+        let product = (amount_x as u128) * (amount_y as u128);
+        let liquidity = sqrt_u128(product);
+        assert!(liquidity > 0, EInsufficientLiquidity);
 
         balance::join(&mut pool.reserve_x, coin::into_balance(coin_x));
         balance::join(&mut pool.reserve_y, coin::into_balance(coin_y));
+        pool.total_liquidity = pool.total_liquidity + liquidity;
 
-        let user_positions = if (table::contains(&pool.positions, sender)) {
-            table::borrow_mut(&mut pool.positions, sender)
-        } else {
-            table::add(&mut pool.positions, sender, vector::empty());
-            table::borrow_mut(&mut pool.positions, sender)
-        };
-        vector::push_back(user_positions, position);
-
-        let position_for_transfer = Position {
-            id: sui::object::new(ctx),
-            pool_id: sui::object::id_address(pool),
-            tick_lower,
-            tick_upper,
-            liquidity,
-            fee_owed_x: 0,
-            fee_owed_y: 0,
-        };
+        let sender = tx_context::sender(ctx);
+        table::add(&mut pool.user_shares, sender, liquidity);
 
         registry.total_tvl = registry.total_tvl + amount_x;
+    }
 
-        event::emit(LiquidityAdded {
-            pool_id: sui::object::id_address(pool),
-            position_id: sui::object::id_address(&position_for_transfer),
-            tick_lower,
-            tick_upper,
-            liquidity,
-            amount_x,
-            amount_y,
-        });
+    // Add additional liquidity
+    public entry fun add_liquidity_additional<X, Y>(
+        pool: &mut LiquidityPool<X, Y>,
+        coin_x: Coin<X>,
+        coin_y: Coin<Y>,
+        registry: &mut PoolRegistry,
+        ctx: &mut TxContext
+    ) {
+        let sender = tx_context::sender(ctx);
+        let amount_x = coin::value(&coin_x);
+        let amount_y = coin::value(&coin_y);
+        assert!(amount_x > 0 && amount_y > 0, EInvalidAmount);
 
-        sui::transfer::public_transfer(position_for_transfer, sender);
+        let reserve_x = balance::value(&pool.reserve_x);
+        let reserve_y = balance::value(&pool.reserve_y);
+        assert!(reserve_x > 0 && reserve_y > 0, EInsufficientBalance);
+
+        assert!((amount_x as u128) * (reserve_y as u128) == (amount_y as u128) * (reserve_x as u128), EInvalidRatio);
+        let liquidity = ((amount_x as u128) * pool.total_liquidity) / (reserve_x as u128);
+        assert!(liquidity > 0, EInsufficientLiquidity);
+
+        balance::join(&mut pool.reserve_x, coin::into_balance(coin_x));
+        balance::join(&mut pool.reserve_y, coin::into_balance(coin_y));
+        pool.total_liquidity = pool.total_liquidity + liquidity;
+
+        let current_liquidity = if (table::contains(&pool.user_shares, sender)) {
+            *table::borrow(&pool.user_shares, sender)
+        } else {
+            0
+        };
+        table::add(&mut pool.user_shares, sender, current_liquidity + liquidity);
+
+        registry.total_tvl = registry.total_tvl + amount_x;
     }
 
     // Remove liquidity
-public entry fun remove_liquidity<X, Y>(
-    pool: &mut LiquidityPool<X, Y>,
-    position: Position,
-    liquidity: u128,
-    registry: &mut PoolRegistry,
-    ctx: &mut sui::tx_context::TxContext
-) {
-    let sender = sui::tx_context::sender(ctx);
-    assert!(position.pool_id == sui::object::id_address(pool), EPositionNotFound);
-    assert!(position.liquidity >= liquidity, EInsufficientLiquidity);
+    public entry fun remove_liquidity<X, Y>(
+        pool: &mut LiquidityPool<X, Y>,
+        amount: u128,
+        registry: &mut PoolRegistry,
+        ctx: &mut TxContext
+    ) {
+        let sender = tx_context::sender(ctx);
+        assert!(table::contains(&pool.user_shares, sender), ENoLiquidity);
+        let user_liquidity = *table::borrow(&pool.user_shares, sender);
+        assert!(user_liquidity >= amount, EInvalidAmount);
 
-    let mut position = position;
-    update_position_fees(pool, &mut position);
+        let reserve_x = balance::value(&pool.reserve_x);
+        let reserve_y = balance::value(&pool.reserve_y);
+        let amount_x = ((amount as u256) * (reserve_x as u256) / (pool.total_liquidity as u256) as u64);
+        let amount_y = ((amount as u256) * (reserve_y as u256) / (pool.total_liquidity as u256) as u64);
 
-    let (amount_x, amount_y) = calculate_amounts(pool, position.tick_lower, position.tick_upper, liquidity);
+        assert!(amount_x > 0 && amount_y > 0, EInsufficientLiquidity);
 
-    update_tick(pool, position.tick_lower, liquidity, false);
-    update_tick(pool, position.tick_upper, liquidity, true);
+        pool.total_liquidity = pool.total_liquidity - amount;
 
-    if (pool.current_tick >= position.tick_lower && pool.current_tick < position.tick_upper) {
-        pool.liquidity = pool.liquidity - liquidity;
-    };
-
-    position.liquidity = position.liquidity - liquidity;
-
-    let coin_x = coin::from_balance(balance::split(&mut pool.reserve_x, amount_x), ctx);
-    let coin_y = coin::from_balance(balance::split(&mut pool.reserve_y, amount_y), ctx);
-    sui::transfer::public_transfer(coin_x, sender);
-    sui::transfer::public_transfer(coin_y, sender);
-
-    registry.total_tvl = registry.total_tvl - amount_x;
-
-    let position_id = sui::object::id_address(&position);
-    event::emit(LiquidityRemoved {
-        pool_id: sui::object::id_address(pool),
-        position_id,
-        tick_lower: position.tick_lower,
-        tick_upper: position.tick_upper,
-        liquidity,
-        amount_x,
-        amount_y,
-    });
-
-    let user_positions = table::borrow_mut(&mut pool.positions, sender);
-    if (position.liquidity == 0) {
-        let Position { id, pool_id: _, tick_lower: _, tick_upper: _, liquidity: _, fee_owed_x, fee_owed_y } = position;
-        sui::object::delete(id);
-        if (fee_owed_x > 0) {
-            let coin_x = coin::from_balance(balance::split(&mut pool.fee_balance_x, fee_owed_x), ctx);
-            sui::transfer::public_transfer(coin_x, sender);
+        if (user_liquidity == amount) {
+            table::remove(&mut pool.user_shares, sender);
+        } else {
+            table::add(&mut pool.user_shares, sender, user_liquidity - amount);
         };
-        if (fee_owed_y > 0) {
-            let coin_y = coin::from_balance(balance::split(&mut pool.fee_balance_y, fee_owed_y), ctx);
-            sui::transfer::public_transfer(coin_y, sender);
+
+        let coin_x = coin::from_balance(balance::split(&mut pool.reserve_x, amount_x), ctx);
+        let coin_y = coin::from_balance(balance::split(&mut pool.reserve_y, amount_y), ctx);
+        transfer::public_transfer(coin_x, sender);
+        transfer::public_transfer(coin_y, sender);
+
+        registry.total_tvl = registry.total_tvl - amount_x;
+    }
+
+    // Claim accumulated fees for LPs
+    public entry fun claim_fees<X, Y>(
+        pool: &mut LiquidityPool<X, Y>,
+        ctx: &mut TxContext
+    ) {
+        let sender = tx_context::sender(ctx);
+        assert!(table::contains(&pool.user_shares, sender), ENoLiquidity);
+        let user_liquidity = *table::borrow(&pool.user_shares, sender);
+
+        let total_fees_x = balance::value(&pool.fee_balance_x);
+        let total_fees_y = balance::value(&pool.fee_balance_y);
+        let user_fee_x = if (pool.total_liquidity > 0) {
+            ((user_liquidity as u256) * (total_fees_x as u256) / (pool.total_liquidity as u256)) as u64
+        } else {
+            0
         };
-        // Remove position from the table
-        let mut i = 0;
-        while (i < vector::length(user_positions)) {
-            let p = vector::borrow(user_positions, i);
-            if (sui::object::id_address(p) == position_id) {
-                let removed_position = vector::swap_remove(user_positions, i);
-                let Position { id, pool_id: _, tick_lower: _, tick_upper: _, liquidity: _, fee_owed_x: _, fee_owed_y: _ } = removed_position;
-                sui::object::delete(id);
-                break
+        let user_fee_y = if (pool.total_liquidity > 0) {
+            ((user_liquidity as u256) * (total_fees_y as u256) / (pool.total_liquidity as u256)) as u64
+        } else {
+            0
+        };
+
+        if (user_fee_x > 0) {
+            let coin_x = coin::from_balance(balance::split(&mut pool.fee_balance_x, user_fee_x), ctx);
+            transfer::public_transfer(coin_x, sender);
+        };
+        if (user_fee_y > 0) {
+            let coin_y = coin::from_balance(balance::split(&mut pool.fee_balance_y, user_fee_y), ctx);
+            transfer::public_transfer(coin_y, sender);
+        }
+    }
+
+    // Claim accumulated platform fees
+    public entry fun claim_platform_fees<X, Y>(
+        _cap: &AdminCap,
+        pool: &mut LiquidityPool<X, Y>,
+        registry: &PoolRegistry,
+        staking_pool: &mut StakingPool,
+        ctx: &mut TxContext
+    ) {
+        let sender = tx_context::sender(ctx);
+        assert!(sender == registry.developer_wallet, ENotAdmin);
+
+        let total_platform_fees_x = balance::value(&pool.platform_fee_x);
+        let total_platform_fees_y = balance::value(&pool.platform_fee_y);
+
+        if (registry.is_distribution_enabled && registry.staking_pool != @0x0) {
+            // Distribute to staking pool
+            if (total_platform_fees_x > 0) {
+                let coin_x = coin::from_balance(balance::split(&mut pool.platform_fee_x, total_platform_fees_x), ctx);
+                xseal::distribute_fees(staking_pool, coin_x, ctx);
             };
-            i = i + 1;
-        };
-    } else {
-        // Update position in the table by removing and re-adding
-        let mut i = 0;
-        let mut found = false;
-        while (i < vector::length(user_positions)) {
-            let p = vector::borrow(user_positions, i);
-            if (sui::object::id_address(p) == position_id) {
-                let removed_position = vector::swap_remove(user_positions, i);
-                let Position { id, pool_id: _, tick_lower: _, tick_upper: _, liquidity: _, fee_owed_x: _, fee_owed_y: _ } = removed_position;
-                sui::object::delete(id);
-                // Create a new Position for storage
-                let new_position = Position {
-                    id: sui::object::new(ctx),
-                    pool_id: position.pool_id,
-                    tick_lower: position.tick_lower,
-                    tick_upper: position.tick_upper,
-                    liquidity: position.liquidity,
-                    fee_owed_x: position.fee_owed_x,
-                    fee_owed_y: position.fee_owed_y,
-                };
-                vector::push_back(user_positions, new_position);
-                found = true;
-                break
+            if (total_platform_fees_y > 0) {
+                let coin_y = coin::from_balance(balance::split(&mut pool.platform_fee_y, total_platform_fees_y), ctx);
+                xseal::distribute_fees(staking_pool, coin_y, ctx);
             };
-            i = i + 1;
-        };
-        // If no matching position was found, transfer a new Position back to the sender
-        if (!found) {
-            let new_position = Position {
-                id: sui::object::new(ctx),
-                pool_id: position.pool_id,
-                tick_lower: position.tick_lower,
-                tick_upper: position.tick_upper,
-                liquidity: position.liquidity,
-                fee_owed_x: position.fee_owed_x,
-                fee_owed_y: position.fee_owed_y,
+        } else {
+            // Transfer to developer wallet
+            if (total_platform_fees_x > 0) {
+                let coin_x = coin::from_balance(balance::split(&mut pool.platform_fee_x, total_platform_fees_x), ctx);
+                transfer::public_transfer(coin_x, registry.developer_wallet);
             };
-            sui::transfer::public_transfer(new_position, sender);
-        };
-        // Delete the original position to consume it
-        let Position { id, pool_id: _, tick_lower: _, tick_upper: _, liquidity: _, fee_owed_x: _, fee_owed_y: _ } = position;
-        sui::object::delete(id);
-    };
-}
-   
+            if (total_platform_fees_y > 0) {
+                let coin_y = coin::from_balance(balance::split(&mut pool.platform_fee_y, total_platform_fees_y), ctx);
+                transfer::public_transfer(coin_y, registry.developer_wallet);
+            };
+        }
+    }
 
-    // Swap X to Y
-    public entry fun swap<X, Y>(
+    // Swap X to Y (single pool)
+    public fun swap_x_to_y<X, Y>(
         pool: &mut LiquidityPool<X, Y>,
         coin_in: Coin<X>,
         min_amount_out: u64,
         clock: &Clock,
-        ctx: &mut sui::tx_context::TxContext
-    ) {
+        ctx: &mut TxContext
+    ): Coin<Y> {
         let amount_in = coin::value(&coin_in);
         assert!(amount_in > 0, EInvalidAmount);
 
-        let (amount_out, fee_amount) = swap_internal(pool, amount_in, true);
-        assert!(amount_out >= min_amount_out, EInsufficientLiquidity);
+        let reserve_x = balance::value(&pool.reserve_x);
+        let reserve_y = balance::value(&pool.reserve_y);
+        assert!(reserve_x > 0 && reserve_y > 0, EInsufficientLiquidity);
+
+        let amount_in_with_fee = (amount_in as u128) * ((10000 - pool.fee_rate) as u128);
+        let amount_out = (amount_in_with_fee * (reserve_y as u128)) / (((reserve_x as u128) * (10000 as u128)) + amount_in_with_fee);
+        assert!(amount_out >= (min_amount_out as u128), EInsufficientLiquidity);
+        assert!(amount_out <= (reserve_y as u128), EInsufficientBalance);
+
+        let fee_amount = (amount_in as u128) * (pool.fee_rate as u128) / (10000 as u128);
+        let platform_fee = (fee_amount * 20) / 100;
+        let lp_fee = fee_amount - platform_fee;
 
         let mut balance_in = coin::into_balance(coin_in);
-        let platform_fee = (fee_amount * 20) / 100;
-        let _lp_fee = fee_amount - platform_fee;
+        let mut fee_balance = balance::split(&mut balance_in, (fee_amount as u64));
+        let platform_fee_balance = balance::split(&mut fee_balance, (platform_fee as u64));
+        let lp_fee_balance = fee_balance;
 
-        balance::join(&mut pool.reserve_x, balance::split(&mut balance_in, amount_in - fee_amount));
-        balance::join(&mut pool.platform_fee_x, balance::split(&mut balance_in, platform_fee));
-        balance::join(&mut pool.fee_balance_x, balance_in);
+        balance::join(&mut pool.platform_fee_x, platform_fee_balance);
+        balance::join(&mut pool.fee_balance_x, lp_fee_balance);
+        balance::join(&mut pool.reserve_x, balance_in);
+        let coin_out = coin::from_balance(balance::split(&mut pool.reserve_y, (amount_out as u64)), ctx);
 
-        let coin_out = coin::from_balance(balance::split(&mut pool.reserve_y, amount_out), ctx);
-        sui::transfer::public_transfer(coin_out, sui::tx_context::sender(ctx));
-
-        event::emit(SwapEvent {
-            pool_id: sui::object::id_address(pool),
-            amount_in,
-            amount_out,
-            zero_for_one: true,
-            fee_amount,
-        });
-
-        update_metrics(pool, amount_in, fee_amount, clock);
+        update_metrics(pool, amount_in, (fee_amount as u64), clock);
+        coin_out
     }
 
-    // Swap Y to X
-    public entry fun swap_reverse<X, Y>(
+    // Swap Y to X (single pool)
+    public fun swap_y_to_x<X, Y>(
         pool: &mut LiquidityPool<X, Y>,
         coin_in: Coin<Y>,
         min_amount_out: u64,
         clock: &Clock,
-        ctx: &mut sui::tx_context::TxContext
-    ) {
+        ctx: &mut TxContext
+    ): Coin<X> {
         let amount_in = coin::value(&coin_in);
         assert!(amount_in > 0, EInvalidAmount);
 
-        let (amount_out, fee_amount) = swap_internal(pool, amount_in, false);
-        assert!(amount_out >= min_amount_out, EInsufficientLiquidity);
+        let reserve_x = balance::value(&pool.reserve_x);
+        let reserve_y = balance::value(&pool.reserve_y);
+        assert!(reserve_x > 0 && reserve_y > 0, EInsufficientLiquidity);
+
+        let amount_in_with_fee = (amount_in as u128) * ((10000 - pool.fee_rate) as u128);
+        let amount_out = (amount_in_with_fee * (reserve_x as u128)) / (((reserve_y as u128) * (10000 as u128)) + amount_in_with_fee);
+        assert!(amount_out >= (min_amount_out as u128), EInsufficientLiquidity);
+        assert!(amount_out <= (reserve_x as u128), EInsufficientBalance);
+
+        let fee_amount = (amount_in as u128) * (pool.fee_rate as u128) / (10000 as u128);
+        let platform_fee = (fee_amount * 20) / 100;
+        let lp_fee = fee_amount - platform_fee;
 
         let mut balance_in = coin::into_balance(coin_in);
-        let platform_fee = (fee_amount * 20) / 100;
-        let _lp_fee = fee_amount - platform_fee;
+        let mut fee_balance = balance::split(&mut balance_in, (fee_amount as u64));
+        let platform_fee_balance = balance::split(&mut fee_balance, (platform_fee as u64));
+        let lp_fee_balance = fee_balance;
 
-        balance::join(&mut pool.reserve_y, balance::split(&mut balance_in, amount_in - fee_amount));
-        balance::join(&mut pool.platform_fee_y, balance::split(&mut balance_in, platform_fee));
-        balance::join(&mut pool.fee_balance_y, balance_in);
+        balance::join(&mut pool.platform_fee_y, platform_fee_balance);
+        balance::join(&mut pool.fee_balance_y, lp_fee_balance);
+        balance::join(&mut pool.reserve_y, balance_in);
+        let coin_out = coin::from_balance(balance::split(&mut pool.reserve_x, (amount_out as u64)), ctx);
 
-        let coin_out = coin::from_balance(balance::split(&mut pool.reserve_x, amount_out), ctx);
-        sui::transfer::public_transfer(coin_out, sui::tx_context::sender(ctx));
-
-        event::emit(SwapEvent {
-            pool_id: sui::object::id_address(pool),
-            amount_in,
-            amount_out,
-            zero_for_one: false,
-            fee_amount,
-        });
-
-        update_metrics(pool, amount_in, fee_amount, clock);
-    }
-
-    // Internal swap logic
-    fun swap_internal<X, Y>(
-        pool: &mut LiquidityPool<X, Y>,
-        amount_in: u64,
-        zero_for_one: bool
-    ): (u64, u64) {
-        let fee_amount = (amount_in * pool.fee_rate) / FEE_DENOMINATOR;
-        let mut amount_in_net = amount_in - fee_amount;
-        let mut amount_out = 0;
-        let mut next_tick = pool.current_tick;
-
-        while (amount_in_net > 0) {
-            if (zero_for_one) {
-                if (next_tick == MIN_TICK) break;
-                next_tick = next_initialized_tick(pool, next_tick, true);
-                let sqrt_price_next = tick_to_sqrt_price(next_tick);
-                let (delta_out, delta_in) = calculate_swap_step(
-                    pool.current_sqrt_price,
-                    sqrt_price_next,
-                    pool.liquidity,
-                    amount_in_net,
-                    zero_for_one
-                );
-                amount_out = amount_out + delta_out;
-                pool.current_sqrt_price = sqrt_price_next;
-                pool.current_tick = next_tick;
-                amount_in_net = amount_in_net - delta_in;
-                if (delta_in == 0) break;
-            } else {
-                if (next_tick == MAX_TICK) break;
-                next_tick = next_initialized_tick(pool, next_tick, false);
-                let sqrt_price_next = tick_to_sqrt_price(next_tick);
-                let (delta_out, delta_in) = calculate_swap_step(
-                    pool.current_sqrt_price,
-                    sqrt_price_next,
-                    pool.liquidity,
-                    amount_in_net,
-                    zero_for_one
-                );
-                amount_out = amount_out + delta_out;
-                pool.current_sqrt_price = sqrt_price_next;
-                pool.current_tick = next_tick;
-                amount_in_net = amount_in_net - delta_in;
-                if (delta_in == 0) break;
-            };
-        };
-
-        update_fee_growth(pool, fee_amount, zero_for_one);
-        (amount_out, fee_amount)
-    }
-
-    // Calculate amounts for liquidity
-    fun calculate_amounts<X, Y>(
-        pool: &LiquidityPool<X, Y>,
-        tick_lower: u32,
-        tick_upper: u32,
-        liquidity: u128
-    ): (u64, u64) {
-        let sqrt_price_lower = tick_to_sqrt_price(tick_lower);
-        let sqrt_price_upper = tick_to_sqrt_price(tick_upper);
-        let current_sqrt_price = pool.current_sqrt_price;
-
-        let mut amount_x = 0;
-        let mut amount_y = 0;
-
-        if (current_sqrt_price >= sqrt_price_lower && current_sqrt_price < sqrt_price_upper) {
-            amount_x = ((liquidity * (sqrt_price_upper - current_sqrt_price)) / (current_sqrt_price * sqrt_price_upper / SQRT_PRICE_PRECISION)) as u64;
-            amount_y = ((liquidity * (current_sqrt_price - sqrt_price_lower)) / SQRT_PRICE_PRECISION) as u64;
-        } else if (current_sqrt_price < sqrt_price_lower) {
-            amount_x = ((liquidity * (sqrt_price_upper - sqrt_price_lower)) / (sqrt_price_lower * sqrt_price_upper / SQRT_PRICE_PRECISION)) as u64;
-        } else {
-            amount_y = ((liquidity * (sqrt_price_upper - sqrt_price_lower)) / SQRT_PRICE_PRECISION) as u64;
-        };
-
-        (amount_x, amount_y)
-    }
-
-    // Update tick data
-    fun update_tick<X, Y>(
-        pool: &mut LiquidityPool<X, Y>,
-        tick: u32,
-        liquidity_delta: u128,
-        lower: bool
-    ) {
-        let tick_data = if (table::contains(&pool.ticks, tick)) {
-            table::borrow_mut(&mut pool.ticks, tick)
-        } else {
-            table::add(&mut pool.ticks, tick, Tick {
-                liquidity_gross: 0,
-                liquidity_net: 0,
-                fee_growth_outside_x: 0,
-                fee_growth_outside_y: 0,
-            });
-            table::borrow_mut(&mut pool.ticks, tick)
-        };
-
-        tick_data.liquidity_gross = tick_data.liquidity_gross + liquidity_delta;
-        if (lower) {
-            tick_data.liquidity_net = tick_data.liquidity_net + liquidity_delta;
-        } else {
-            tick_data.liquidity_net = tick_data.liquidity_net - liquidity_delta;
-        };
-    }
-
-    // Update fee growth
-    fun update_fee_growth<X, Y>(
-        pool: &mut LiquidityPool<X, Y>,
-        fee_amount: u64,
-        zero_for_one: bool
-    ) {
-        if (pool.liquidity > 0) {
-            let fee_growth = ((fee_amount as u128) * SQRT_PRICE_PRECISION) / pool.liquidity;
-            if (zero_for_one) {
-                pool.fee_growth_global_x = pool.fee_growth_global_x + fee_growth;
-            } else {
-                pool.fee_growth_global_y = pool.fee_growth_global_y + fee_growth;
-            };
-        };
-    }
-
-    // Update position fees
-    fun update_position_fees<X, Y>(
-        pool: &mut LiquidityPool<X, Y>,
-        position: &mut Position
-    ) {
-        let tick_lower = position.tick_lower;
-        let tick_upper = position.tick_upper;
-        let tick_data_lower = table::borrow(&pool.ticks, tick_lower);
-        let _tick_data_upper = table::borrow(&pool.ticks, tick_upper);
-
-        let fee_growth_inside_x = if (pool.current_tick >= tick_lower && pool.current_tick < tick_upper) {
-            pool.fee_growth_global_x - tick_data_lower.fee_growth_outside_x
-        } else {
-            tick_data_lower.fee_growth_outside_x
-        };
-        let fee_growth_inside_y = if (pool.current_tick >= tick_lower && pool.current_tick < tick_upper) {
-            pool.fee_growth_global_y - tick_data_lower.fee_growth_outside_y
-        } else {
-            tick_data_lower.fee_growth_outside_y
-        };
-
-        let fee_x = ((position.liquidity * fee_growth_inside_x) / SQRT_PRICE_PRECISION) as u64;
-        let fee_y = ((position.liquidity * fee_growth_inside_y) / SQRT_PRICE_PRECISION) as u64;
-        position.fee_owed_x = position.fee_owed_x + fee_x;
-        position.fee_owed_y = position.fee_owed_y + fee_y;
-    }
-
-    // Get next initialized tick
-    fun next_initialized_tick<X, Y>(
-        pool: &LiquidityPool<X, Y>,
-        current_tick: u32,
-        zero_for_one: bool
-    ): u32 {
-        let mut next_tick = if (zero_for_one) {
-            current_tick - pool.tick_spacing
-        } else {
-            current_tick + pool.tick_spacing
-        };
-
-        while (next_tick >= MIN_TICK && next_tick <= MAX_TICK) {
-            if (table::contains(&pool.ticks, next_tick)) {
-                let tick_data = table::borrow(&pool.ticks, next_tick);
-                if (tick_data.liquidity_gross > 0) {
-                    return next_tick
-                };
-            };
-            next_tick = if (zero_for_one) {
-                next_tick - pool.tick_spacing
-            } else {
-                next_tick + pool.tick_spacing
-            };
-        };
-        if (zero_for_one) MIN_TICK else MAX_TICK
-    }
-
-    // Custom power function for u128
-    fun pow_u128(base: u128, exponent: u128): u128 {
-        if (exponent == 0) return 1;
-        let mut result = 1;
-        let mut b = base;
-        let mut e = exponent;
-        while (e > 0) {
-            if (e % 2 == 1) {
-                result = result * b;
-            };
-            b = b * b;
-            e = e / 2;
-        };
-        result
-    }
-
-    // Convert tick to sqrt price
-    fun tick_to_sqrt_price(tick: u32): u128 {
-        let tick_abs = (tick as u128);
-        let base = 10001; // Approximation of 1.0001
-        let exponent = tick_abs / 2;
-        let sqrt_price = (pow_u128(base, exponent) * SQRT_PRICE_PRECISION) / pow_u128(10, 4);
-        sqrt_price
-    }
-
-    // Calculate swap step
-    fun calculate_swap_step(
-        sqrt_price_current: u128,
-        sqrt_price_next: u128,
-        liquidity: u128,
-        amount_in: u64,
-        zero_for_one: bool
-    ): (u64, u64) {
-        let mut _delta_out: u64 = 0;
-        let mut _delta_in: u64 = 0;
-
-        if (zero_for_one) {
-            _delta_out = ((liquidity * (sqrt_price_current - sqrt_price_next)) / (sqrt_price_current * sqrt_price_next / SQRT_PRICE_PRECISION)) as u64;
-            _delta_in = ((liquidity * (sqrt_price_current - sqrt_price_next)) / SQRT_PRICE_PRECISION) as u64;
-        } else {
-            _delta_out = ((liquidity * (sqrt_price_next - sqrt_price_current)) / SQRT_PRICE_PRECISION) as u64;
-            _delta_in = ((liquidity * (sqrt_price_next - sqrt_price_current)) / (sqrt_price_current * sqrt_price_next / SQRT_PRICE_PRECISION)) as u64;
-        };
-
-        if (_delta_in > amount_in) {
-            let delta_out_u128 = _delta_out as u128;
-            let amount_in_u128 = amount_in as u128;
-            let delta_in_u128 = _delta_in as u128;
-            _delta_out = ((delta_out_u128 * amount_in_u128) / delta_in_u128) as u64;
-            _delta_in = amount_in;
-        };
-
-        (_delta_out, _delta_in)
-    }
-
-    // Claim accumulated fees
-    public entry fun claim_fees<X, Y>(
-        pool: &mut LiquidityPool<X, Y>,
-        position: &mut Position,
-        ctx: &mut sui::tx_context::TxContext
-    ) {
-        assert!(position.pool_id == sui::object::id_address(pool), EPositionNotFound);
-        update_position_fees(pool, position);
-
-        let sender = sui::tx_context::sender(ctx);
-        if (position.fee_owed_x > 0) {
-            let coin_x = coin::from_balance(balance::split(&mut pool.fee_balance_x, position.fee_owed_x), ctx);
-            sui::transfer::public_transfer(coin_x, sender);
-            position.fee_owed_x = 0;
-        };
-        if (position.fee_owed_y > 0) {
-            let coin_y = coin::from_balance(balance::split(&mut pool.fee_balance_y, position.fee_owed_y), ctx);
-            sui::transfer::public_transfer(coin_y, sender);
-            position.fee_owed_y = 0;
-        };
-    }
-
-    // Claim platform fees
-    #[allow(unused_mut_parameter)]
-    public entry fun claim_platform_fees<X, Y>(
-        _cap: &AdminCap,
-        pool: &mut LiquidityPool<X, Y>,
-        ctx: &mut sui::tx_context::TxContext
-    ) {
-        let total_platform_fees_x = balance::value(&pool.platform_fee_x);
-        let total_platform_fees_y = balance::value(&pool.platform_fee_y);
-
-        if (total_platform_fees_x > 0) {
-            let coin_x = coin::from_balance(balance::split(&mut pool.platform_fee_x, total_platform_fees_x), ctx);
-            sui::transfer::public_transfer(coin_x, sui::tx_context::sender(ctx));
-        };
-        if (total_platform_fees_y > 0) {
-            let coin_y = coin::from_balance(balance::split(&mut pool.platform_fee_y, total_platform_fees_y), ctx);
-            sui::transfer::public_transfer(coin_y, sui::tx_context::sender(ctx));
-        };
+        update_metrics(pool, amount_in, (fee_amount as u64), clock);
+        coin_out
     }
 
     // Update 24-hour metrics
-    fun update_metrics<X, Y>(
-        pool: &mut LiquidityPool<X, Y>,
-        volume: u64,
-        fee: u64,
-        clock: &Clock
-    ) {
+    fun update_metrics<X, Y>(pool: &mut LiquidityPool<X, Y>, volume: u64, fee: u64, clock: &Clock) {
         let current_time = clock::timestamp_ms(clock);
         assert!(current_time >= pool.last_update, EInvalidTimestamp);
         let one_day_ms = 24 * 60 * 60 * 1000;
@@ -758,30 +510,63 @@ public entry fun remove_liquidity<X, Y>(
         };
     }
 
-    // Query functions
-    public fun get_pool_info<X, Y>(pool: &LiquidityPool<X, Y>): (u64, u64, u64, u32, u128, u64, u64) {
+    // Get pool reserves and fees
+    public fun get_pool_info<X, Y>(pool: &LiquidityPool<X, Y>): (u64, u64, u64, u64, u64, address) {
         (
             balance::value(&pool.reserve_x),
             balance::value(&pool.reserve_y),
             pool.fee_rate,
-            pool.current_tick,
-            pool.current_sqrt_price,
             pool.volume_24h,
-            pool.fees_24h
+            pool.fees_24h,
+            object::uid_to_address(&pool.id)
         )
     }
 
-    public fun get_position_info(position: &Position): (u32, u32, u128, u64, u64) {
-        (
-            position.tick_lower,
-            position.tick_upper,
-            position.liquidity,
-            position.fee_owed_x,
-            position.fee_owed_y
-        )
+    // Get user's liquidity and pending fees
+    public fun get_user_info<X, Y>(pool: &LiquidityPool<X, Y>, user: address): (u128, u64, u64) {
+        let user_liquidity = if (table::contains(&pool.user_shares, user)) {
+            *table::borrow(&pool.user_shares, user)
+        } else {
+            0
+        };
+        let user_fee_x = if (pool.total_liquidity > 0) {
+            ((user_liquidity as u256) * (balance::value(&pool.fee_balance_x) as u256) / (pool.total_liquidity as u256)) as u64
+        } else {
+            0
+        };
+        let user_fee_y = if (pool.total_liquidity > 0) {
+            ((user_liquidity as u256) * (balance::value(&pool.fee_balance_y) as u256) / (pool.total_liquidity as u256)) as u64
+        } else {
+            0
+        };
+        (user_liquidity, user_fee_x, user_fee_y)
     }
 
+    // Estimate APR
+    public fun estimate_apr<X, Y>(pool: &LiquidityPool<X, Y>): u64 {
+        let fees_24h = pool.fees_24h;
+        let reserve_x = balance::value(&pool.reserve_x);
+        if (reserve_x == 0) return 0;
+        (((fees_24h as u128) * 36500) / (reserve_x as u128)) as u64
+    }
+
+    // Get TVL
     public fun get_tvl(registry: &PoolRegistry): u64 {
         registry.total_tvl
+    }
+
+    // Get square root
+    fun sqrt_u128(y: u128): u128 {
+        if (y < 4) {
+            if (y == 0) return 0;
+            return 1;
+        };
+        let mut z = y / 2;
+        let mut x = y;
+        while (z < x) {
+            x = z;
+            z = (y / z + z) / 2;
+        };
+        x
     }
 }
